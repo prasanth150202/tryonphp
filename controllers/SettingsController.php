@@ -155,6 +155,7 @@ class SettingsController
             'icon_opacity'           => (int)($css['icon_opacity']           ?? $d['icon_opacity']),
             'show_on_collection'     => (bool)($css['show_on_collection']    ?? $d['show_on_collection']),
             'collection_position'    => $css['collection_position']    ?? $d['collection_position'],
+            'show_watermark'         => (bool)($css['show_watermark']        ?? $d['show_watermark']),
             'share_whatsapp_enabled' => (bool)($css['share_whatsapp_enabled'] ?? $d['share_whatsapp_enabled']),
             'save_image_enabled'     => (bool)($css['save_image_enabled']    ?? $d['save_image_enabled']),
             'privacy_notice_shown'   => (bool)($css['privacy_notice_shown']  ?? $d['privacy_notice_shown']),

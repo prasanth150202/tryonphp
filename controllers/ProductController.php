@@ -18,20 +18,25 @@ class ProductController
 
     public function sync(): void
     {
-        $merchant = ApiKeyAuth::handle();
+        try {
+            $merchant = ApiKeyAuth::handle();
 
-        $body = (array)(json_decode((string)file_get_contents('php://input'), true) ?? []);
+            $body = (array)(json_decode((string)file_get_contents('php://input'), true) ?? []);
 
-        $required = ['shopify_product_id', 'shopify_product_gid'];
-        foreach ($required as $field) {
-            if (empty($body[$field])) {
-                respondJson(['error' => "Missing field: {$field}"], 400);
+            $required = ['shopify_product_id', 'shopify_product_gid'];
+            foreach ($required as $field) {
+                if (empty($body[$field])) {
+                    respondJson(['error' => "Missing field: {$field}"], 400);
+                }
             }
-        }
 
-        $repo = new ProductRepo();
-        $id   = $repo->syncProduct((int)$merchant['id'], $body);
-        respondJson(['id' => $id]);
+            $repo = new ProductRepo();
+            $id   = $repo->syncProduct((int)$merchant['id'], $body);
+            respondJson(['id' => $id]);
+        } catch (\Throwable $e) {
+            error_log('[FitSnap Product] sync error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+            respondJson(['error' => 'Product sync failed: ' . $e->getMessage()], 500);
+        }
     }
 
     public function getMappings(): void
