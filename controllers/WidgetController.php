@@ -60,8 +60,8 @@ class WidgetController
         // collection icons and validate the product-page button without relying
         // solely on Shopify's CDN-cached metafield HTML.
         $productsData    = $repo->getProductsData((int)$merchant['id']);
-        $enabledProducts = $productsData['enabled_products'] ?? [];
-        $allProducts     = $productsData['products']         ?? [];
+        $enabledProducts = $productsData['enabled_products']; // null = no data yet, [] = zero enabled
+        $allProducts     = $productsData['products'] ?? [];
 
         // Build a handle lookup from ALL products (including old rows that
         // predate the handle column). collection_products contains every product
@@ -93,18 +93,24 @@ class WidgetController
 
         $flat = $this->flatConfig($raw);
 
-        $flat['enabled_product_ids'] = array_values(array_map(
-            function ($p) { return (string)($p['shopify_product_id'] ?? ''); },
-            $enabledProducts
-        ));
-        $flat['enabled_product_handles'] = array_values(array_filter(array_map(
-            function ($p) use ($handleMap) {
-                $pid = (string)($p['shopify_product_id'] ?? '');
-                $h   = (string)($p['handle'] ?? '');
-                return $h !== '' ? $h : ($handleMap[$pid] ?? '');
-            },
-            $enabledProducts
-        )));
+        // Only include enabled-product lists when the data is actually populated.
+        // Omitting the keys causes the JS to fall back to "show icon on all cards"
+        // mode, which is the correct behaviour before any product sync has run.
+        // Sending an empty array would (incorrectly) hide all collection icons.
+        if (is_array($enabledProducts)) {
+            $flat['enabled_product_ids'] = array_values(array_map(
+                function ($p) { return (string)($p['shopify_product_id'] ?? ''); },
+                $enabledProducts
+            ));
+            $flat['enabled_product_handles'] = array_values(array_filter(array_map(
+                function ($p) use ($handleMap) {
+                    $pid = (string)($p['shopify_product_id'] ?? '');
+                    $h   = (string)($p['handle'] ?? '');
+                    return $h !== '' ? $h : ($handleMap[$pid] ?? '');
+                },
+                $enabledProducts
+            )));
+        }
 
         respondJson($flat);
     }

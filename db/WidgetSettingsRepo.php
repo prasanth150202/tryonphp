@@ -38,9 +38,13 @@ class WidgetSettingsRepo
     public function getProductsData(int $merchantId): array
     {
         $row = $this->fetchRow($merchantId);
+        // Return null (not []) when the enabled_products column is absent or NULL.
+        // Callers must distinguish "no data available" (null) from "zero products enabled" ([]).
+        $rawEnabled = $row['enabled_products'] ?? null;
+        $decoded    = $rawEnabled !== null ? json_decode($rawEnabled, true) : null;
         return [
-            'products'          => json_decode($row['products_json']    ?? 'null', true) ?? [],
-            'enabled_products'  => json_decode($row['enabled_products'] ?? 'null', true) ?? [],
+            'products'         => json_decode($row['products_json'] ?? 'null', true) ?? [],
+            'enabled_products' => $decoded,
         ];
     }
 
