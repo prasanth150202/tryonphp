@@ -8,8 +8,8 @@ namespace TryFit\Controllers;
 use TryFit\AppConfig;
 use TryFit\Db\MerchantRepo;
 use TryFit\Middleware\PlanLimitCheck;
-use VTON\FashnClient;
 use VTON\ImageUtils;
+use VTON\TryOnDiffusionClient;
 
 class TryOnController
 {
@@ -92,15 +92,14 @@ class TryOnController
             respondJson(['error' => 'clothing_image and avatar_image are required'], 400);
         }
 
-        // ── Fashn.ai (IDM-VTON) ──────────────────────────────────────────────
-        if (AppConfig::fashnApiKey() === '') {
-            respondJson(['error' => 'Try-on service is not configured. Add FASHN_API_KEY to .env.'], 503);
+        // ── Try-On Diffusion (RapidAPI) ──────────────────────────────────────
+        if (AppConfig::vtonApiKey() === '' || AppConfig::vtonApiUrl() === '') {
+            respondJson(['error' => 'Try-on service is not configured. Add TRY_ON_DIFFUSION_DEMO_API_KEY / TRY_ON_DIFFUSION_DEMO_API_URL to .env.'], 503);
             return;
         }
 
-        // Resolve garment type — Fashn.ai requires it as a category parameter
-        // ('tops' | 'bottoms' | 'one-pieces'). Fashn's IDM-VTON is image-only
-        // (no text prompt input), so no prompt resolution is needed here.
+        // Only used to gate flat-lay pre-conversion below — Try-On Diffusion
+        // is prompt-driven and has no garment category parameter.
         $garmentType = $this->resolveGarmentType($mapping, $payload);
 
         $seed      = isset($payload['seed']) ? (int)$payload['seed'] : -1;
@@ -113,11 +112,9 @@ class TryOnController
         // 'on_model'        — garment already worn by a model
         $imageType = strtolower((string)(is_array($mapping) ? ($mapping['image_type'] ?? 'flat_lay') : 'flat_lay'));
 
-        // Fashn's IDM-VTON only knows pre-stitched Western silhouettes — it has
-        // no concept of draping unstitched fabric, so a flat saree/lehenga photo
-        // gets painted onto a generic dress shape instead of an actual drape.
-        // Route these through FlatLayConverter first to get a photorealistic
-        // worn reference.
+        // A flat, unworn saree/lehenga photo doesn't drape correctly when fed
+        // straight into the try-on model. Route these through FlatLayConverter
+        // first to get a photorealistic worn reference.
         $clothingPromptText = (string)($mapping['clothing_prompt'] ?? ($payload['clothing_prompt'] ?? ''));
         $useFlatLayConversion = $garmentType === 'full'
             && $imageType === 'flat_lay'
@@ -126,17 +123,12 @@ class TryOnController
 
         $tempFiles = [];
 
-        // All garment source types (flat-lay, ghost-mannequin, on-model) are sent
-        // to Fashn.ai directly — IDM-VTON handles human parsing, clothing masking,
-        // and pose/drape conditioning internally, no separate pre-processing step.
         $clothingPath = null;
         if ($useFlatLayConversion) {
             require_once dirname(__DIR__) . '/src/FlatLayConverter.php';
             $converter    = new \VTON\FlatLayConverter(AppConfig::falApiKey(), AppConfig::tempDir());
             $clothingPath = $converter->getWornReference($clothingInput, $flatLayHint, $tempFiles);
-            if ($clothingPath !== null) {
-                $imageType = 'on_model'; // now a worn photo — drives garment_photo_type below
-            } else {
+            if ($clothingPath === null) {
                 writeLog('WARNING', 'FlatLayConverter failed, falling back to raw flat-lay image', [
                     'hint' => $flatLayHint,
                 ]);
@@ -166,33 +158,22 @@ class TryOnController
         $clothingPath = ImageUtils::ensureMinimumSize($clothingPath, 768, 768, $tempFiles);
         $avatarPath   = ImageUtils::ensureMinimumSize($avatarPath,   768, 768, $tempFiles);
 
-        require_once dirname(__DIR__) . '/src/FashnClient.php';
+        require_once dirname(__DIR__) . '/src/TryOnDiffusionClient.php';
 
-        $fashnCategory = match ($garmentType) {
-            'bottom' => 'bottoms',
-            'full'   => 'one-pieces',
-            default  => 'tops',
-        };
-
-        // Fashn's native garment_photo_type tells it how to interpret the source
-        // image — a flat, unworn garment shot needs different handling than one
-        // already worn by a model or shown on a ghost mannequin form.
-        $garmentPhotoType = match ($imageType) {
-            'flat_lay' => 'flat-lay',
-            'on_model' => 'model',
-            default    => 'auto', // ghost_mannequin has no direct match — let Fashn detect it
-        };
-        $fashnParams = [
-            'model_image'        => ImageUtils::fileToBase64Uri($avatarPath),
-            'garment_image'      => ImageUtils::fileToBase64Uri($clothingPath),
-            'category'           => $fashnCategory,
-            'garment_photo_type' => $garmentPhotoType,
-            'mode'               => ($garmentType === 'full') ? 'quality' : AppConfig::fashnApiMode(),
-            'seed'               => $seed,
+        $tryOnParams = [
+            'clothing_image_path' => $clothingPath,
+            'avatar_image_path'   => $avatarPath,
+            'seed'                => $seed,
         ];
+        if ($clothingPromptText !== '') {
+            $tryOnParams['clothing_prompt'] = $clothingPromptText;
+        }
+        if ($avatarSex !== null) {
+            $tryOnParams['avatar_sex'] = $avatarSex;
+        }
 
-        $fashnClient = new FashnClient(AppConfig::fashnApiKey(), AppConfig::fashnApiMode());
-        $result      = $fashnClient->tryOn($fashnParams);
+        $tryOnClient = new TryOnDiffusionClient(AppConfig::vtonApiUrl(), AppConfig::vtonApiKey());
+        $result      = $tryOnClient->tryOnFile($tryOnParams);
 
         $this->cleanupTempFiles($tempFiles);
 
@@ -434,8 +415,8 @@ class TryOnController
         $prompt = $mapping['clothing_prompt'] ?? ($payload['clothing_prompt'] ?? null);
 
         // Full-body garments (saree, lehenga, dress…) must always map to 'full'
-        // regardless of what the merchant stored — sending them as 'tops' produces
-        // a short-dress result because Fashn only replaces the upper body.
+        // regardless of what the merchant stored — this drives the flat-lay
+        // pre-conversion gate below, not an upstream API parameter.
         if (!empty($prompt) && $this->inferGarmentTypeFromPrompt($prompt) === 'full') {
             return 'full';
         }
@@ -451,7 +432,7 @@ class TryOnController
     }
 
     /**
-     * Maps a clothing prompt to a Fashn garment-type category.
+     * Maps a clothing prompt to a garment-type category.
      * Returns 'top', 'bottom', or 'full'.
      */
     private function inferGarmentTypeFromPrompt(?string $prompt): string
