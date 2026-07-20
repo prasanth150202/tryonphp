@@ -8,44 +8,11 @@ namespace TryFit\Controllers;
 use TryFit\AppConfig;
 use TryFit\Db\MerchantRepo;
 use TryFit\Middleware\PlanLimitCheck;
-use VTON\Config;
 use VTON\FashnClient;
 use VTON\ImageUtils;
-use VTON\TryOnDiffusionClient;
 
 class TryOnController
 {
-    // Clothing prompt: drives garment rendering quality and fit accuracy
-    private const DEFAULT_CLOTHING_PROMPT =
-        'Photorealistic professional ecommerce fashion try-on image. ' .
-        'Transfer ONLY the clothing item onto the person. ' .
-        'Fit the garment naturally along the chest, shoulders, waist, and arms. ' .
-        'Align collar and neckline precisely with the person\'s neck. ' .
-        'Align sleeve cuffs with wrists. Match garment drape to the body\'s pose and gravity. ' .
-        'Preserve exact fabric texture, color, and pattern from the product image. ' .
-        'Maintain realistic fabric folds, wrinkles, and stretch at joints. ' .
-        'Clean garment edges with no fringing or bleed into skin. ' .
-        'Studio lighting, sharp focus, high fidelity, fashion-model quality output.';
-
-    // Clothing negative prompt: appended to clothing_prompt to block artefacts
-    private const DEFAULT_CLOTHING_NEGATIVE =
-        'Negative: deformed anatomy, broken skeleton, floating face, disconnected head, ' .
-        'missing torso, cropped body, duplicate limbs, extra arms, extra legs, merged body parts, ' .
-        'melted body, warped clothing, stretched fabric, blurry garment, ghost artifacts, ' .
-        'distorted proportions, wrong skin color, bad hands, mangled fingers, ' .
-        'AI artifacts, painterly style, cartoon, sketch, watercolor, low quality, pixelated.';
-
-    // Avatar prompt: locks the person\'s identity, pose, and everything below the waist
-    private const DEFAULT_AVATAR_PROMPT =
-        'PRESERVE EXACTLY: the person\'s face, eyes, nose, mouth, skin tone, hairstyle, ' .
-        'hair color, body shape, body proportions, arm positions, hand shape, fingers, ' .
-        'leg position, footwear, accessories, jewelry, and the full background scene. ' .
-        'KEEP UNCHANGED: the original camera angle, framing, lighting direction, shadow placement, ' .
-        'image composition, and all lower-body clothing (pants, skirt, shoes). ' .
-        'DO NOT: regenerate the full body, alter the face, change the pose, ' .
-        'add or remove limbs, crop the image, modify skin, or change background. ' .
-        'Only the upper-body garment region should be replaced. Everything else must be pixel-identical.';
-
     public function handle(): void
     {
         try {
@@ -125,9 +92,60 @@ class TryOnController
             respondJson(['error' => 'clothing_image and avatar_image are required'], 400);
         }
 
+        // ── Fashn.ai (IDM-VTON) ──────────────────────────────────────────────
+        if (AppConfig::fashnApiKey() === '') {
+            respondJson(['error' => 'Try-on service is not configured. Add FASHN_API_KEY to .env.'], 503);
+            return;
+        }
+
+        // Resolve garment type — Fashn.ai requires it as a category parameter
+        // ('tops' | 'bottoms' | 'one-pieces'). Fashn's IDM-VTON is image-only
+        // (no text prompt input), so no prompt resolution is needed here.
+        $garmentType = $this->resolveGarmentType($mapping, $payload);
+
+        $seed      = isset($payload['seed']) ? (int)$payload['seed'] : -1;
+        $avatarSex = in_array($payload['avatar_sex'] ?? null, ['male', 'female'], true)
+            ? $payload['avatar_sex']
+            : (is_array($mapping) ? ($mapping['avatar_sex'] ?? null) : null);
+
+        // 'flat_lay'        — garment photographed flat, unworn (e.g. folded saree)
+        // 'ghost_mannequin' — invisible mannequin form shot
+        // 'on_model'        — garment already worn by a model
+        $imageType = strtolower((string)(is_array($mapping) ? ($mapping['image_type'] ?? 'flat_lay') : 'flat_lay'));
+
+        // Fashn's IDM-VTON only knows pre-stitched Western silhouettes — it has
+        // no concept of draping unstitched fabric, so a flat saree/lehenga photo
+        // gets painted onto a generic dress shape instead of an actual drape.
+        // Route these through FlatLayConverter first to get a photorealistic
+        // worn reference.
+        $clothingPromptText = (string)($mapping['clothing_prompt'] ?? ($payload['clothing_prompt'] ?? ''));
+        $useFlatLayConversion = $garmentType === 'full'
+            && $imageType === 'flat_lay'
+            && AppConfig::useFlatLayConverter();
+        $flatLayHint = $this->inferFlatLayGarmentHint($clothingPromptText);
+
         $tempFiles = [];
 
-        $clothingPath = $this->inputToTempFile($clothingInput, $tempFiles);
+        // All garment source types (flat-lay, ghost-mannequin, on-model) are sent
+        // to Fashn.ai directly — IDM-VTON handles human parsing, clothing masking,
+        // and pose/drape conditioning internally, no separate pre-processing step.
+        $clothingPath = null;
+        if ($useFlatLayConversion) {
+            require_once dirname(__DIR__) . '/src/FlatLayConverter.php';
+            $converter    = new \VTON\FlatLayConverter(AppConfig::falApiKey(), AppConfig::tempDir());
+            $clothingPath = $converter->getWornReference($clothingInput, $flatLayHint, $tempFiles);
+            if ($clothingPath !== null) {
+                $imageType = 'on_model'; // now a worn photo — drives garment_photo_type below
+            } else {
+                writeLog('WARNING', 'FlatLayConverter failed, falling back to raw flat-lay image', [
+                    'hint' => $flatLayHint,
+                ]);
+            }
+        }
+
+        if ($clothingPath === null) {
+            $clothingPath = $this->inputToTempFile($clothingInput, $tempFiles);
+        }
         if ($clothingPath === null) {
             $this->cleanupTempFiles($tempFiles);
             respondJson(['error' => 'Failed to load clothing_image'], 400);
@@ -148,71 +166,33 @@ class TryOnController
         $clothingPath = ImageUtils::ensureMinimumSize($clothingPath, 768, 768, $tempFiles);
         $avatarPath   = ImageUtils::ensureMinimumSize($avatarPath,   768, 768, $tempFiles);
 
-        // Use per-product prompts from DB mapping or payload; fall back to quality defaults.
-        // For the clothing prompt, always append the negative prompt block so the model
-        // knows what NOT to generate regardless of whether a custom prompt is set.
-        $clothingPromptBase = $this->normalizeText($payload['clothing_prompt'] ?? null)
-            ?? self::DEFAULT_CLOTHING_PROMPT;
-        $clothingPrompt = $clothingPromptBase . ' ' . self::DEFAULT_CLOTHING_NEGATIVE;
-        $avatarPrompt   = $this->normalizeText($payload['avatar_prompt'] ?? null)
-            ?? self::DEFAULT_AVATAR_PROMPT;
+        require_once dirname(__DIR__) . '/src/FashnClient.php';
 
-        $seed        = isset($payload['seed']) ? (int)$payload['seed'] : -1;
-        $avatarSex   = in_array($payload['avatar_sex'] ?? null, ['male', 'female'], true)
-            ? $payload['avatar_sex']
-            : ($mapping['avatar_sex'] ?? null);
+        $fashnCategory = match ($garmentType) {
+            'bottom' => 'bottoms',
+            'full'   => 'one-pieces',
+            default  => 'tops',
+        };
 
-        // Resolve garment type before calling the AI — Fashn.ai requires it as
-        // a category parameter ('tops' | 'bottoms' | 'one-pieces').
-        $garmentType = $this->resolveGarmentType($mapping, $payload);
+        // Fashn's native garment_photo_type tells it how to interpret the source
+        // image — a flat, unworn garment shot needs different handling than one
+        // already worn by a model or shown on a ghost mannequin form.
+        $garmentPhotoType = match ($imageType) {
+            'flat_lay' => 'flat-lay',
+            'on_model' => 'model',
+            default    => 'auto', // ghost_mannequin has no direct match — let Fashn detect it
+        };
+        $fashnParams = [
+            'model_image'        => ImageUtils::fileToBase64Uri($avatarPath),
+            'garment_image'      => ImageUtils::fileToBase64Uri($clothingPath),
+            'category'           => $fashnCategory,
+            'garment_photo_type' => $garmentPhotoType,
+            'mode'               => ($garmentType === 'full') ? 'quality' : AppConfig::fashnApiMode(),
+            'seed'               => $seed,
+        ];
 
-        if (AppConfig::useFashn()) {
-            // ── Fashn.ai path (IDM-VTON) ────────────────────────────────────────
-            require_once dirname(__DIR__) . '/src/FashnClient.php';
-            // Fashn uses base64 data URIs, proper human parsing, clothing masking,
-            // and pose conditioning internally — no prompt tuning is needed.
-            $fashnCategory = match ($garmentType) {
-                'bottom' => 'bottoms',
-                'full'   => 'one-pieces',
-                default  => 'tops',
-            };
-
-            $fashnParams = [
-                'model_image'        => ImageUtils::fileToBase64Uri($avatarPath),
-                'garment_image'      => ImageUtils::fileToBase64Uri($clothingPath),
-                'category'           => $fashnCategory,
-                'adjust_hands'       => true,
-                'restore_background' => true,
-                'restore_clothes'    => true,
-                'seed'               => $seed,
-            ];
-
-            // Flag long tops (kurti, kurta, tunic, kaftan…) so Fashn masks correctly
-            if ($garmentType === 'top') {
-                $pLower = strtolower($clothingPrompt);
-                if (preg_match('/\b(kurti|kurta|tunic|kaftan|longline|long[\s_-]*shirt|long[\s_-]*top)\b/', $pLower)) {
-                    $fashnParams['long_top'] = true;
-                }
-            }
-
-            $fashnClient = new FashnClient(AppConfig::fashnApiKey(), AppConfig::fashnApiMode());
-            $result      = $fashnClient->tryOn($fashnParams);
-        } else {
-            // ── TryOnDiffusion path (RapidAPI legacy) ───────────────────────────
-            $params = [
-                'clothing_image_path'   => $clothingPath,
-                'avatar_image_path'     => $avatarPath,
-                'background_image_path' => null,
-                'clothing_prompt'       => $clothingPrompt,
-                'avatar_prompt'         => $avatarPrompt,
-                'avatar_sex'            => $avatarSex,
-                'background_prompt'     => null,
-                'seed'                  => $seed,
-            ];
-
-            $client = new TryOnDiffusionClient(Config::apiUrl(), Config::apiKey());
-            $result = $client->tryOnFile($params);
-        }
+        $fashnClient = new FashnClient(AppConfig::fashnApiKey(), AppConfig::fashnApiMode());
+        $result      = $fashnClient->tryOn($fashnParams);
 
         $this->cleanupTempFiles($tempFiles);
 
@@ -346,6 +326,48 @@ class TryOnController
             $input = 'https:' . $input;
         }
 
+        $localFile = null;
+        $parsedUrl = parse_url($input);
+        if (isset($parsedUrl['path'])) {
+            $urlPath = $parsedUrl['path'];
+            $isLocal = false;
+            $requestHost = isset($parsedUrl['host']) ? strtolower($parsedUrl['host']) : '';
+            $myHost = isset($_SERVER['HTTP_HOST']) ? strtolower(explode(':', $_SERVER['HTTP_HOST'])[0]) : 'localhost';
+            $baseUrlHost = strtolower(parse_url(baseUrl(), PHP_URL_HOST) ?? '');
+            
+            if ($requestHost === '' || $requestHost === $myHost || $requestHost === $baseUrlHost || $requestHost === '127.0.0.1') {
+                $isLocal = true;
+            }
+            
+            if ($isLocal) {
+                $basePath = basePath();
+                if ($basePath !== '' && str_starts_with($urlPath, $basePath)) {
+                    $urlPath = substr($urlPath, strlen($basePath));
+                }
+                if (preg_match('#^/temp/([^/]+)$#', $urlPath, $m)) {
+                    $filename = explode('?', $m[1])[0];
+                    $candidate = AppConfig::tempDir() . DIRECTORY_SEPARATOR . $filename;
+                    if (is_file($candidate)) {
+                        $localFile = $candidate;
+                    }
+                } elseif (preg_match('#^/models/([^/]+)/([^/]+)$#', $urlPath, $m)) {
+                    $genderVal = $m[1];
+                    $filename = explode('?', $m[2])[0];
+                    $candidate = dirname(__DIR__) . DIRECTORY_SEPARATOR . 'models' . DIRECTORY_SEPARATOR . $genderVal . DIRECTORY_SEPARATOR . $filename;
+                    if (is_file($candidate)) {
+                        $localFile = $candidate;
+                    }
+                }
+            }
+        }
+
+        if ($localFile !== null) {
+            if (@copy($localFile, $tempPath)) {
+                return $tempPath;
+            }
+            return null;
+        }
+
         // Remote URL — download via curl
         $fp = fopen($tempPath, 'wb');
         if ($fp === false) {
@@ -358,6 +380,8 @@ class TryOnController
             CURLOPT_TIMEOUT => 30,
             CURLOPT_FILE => $fp,
             CURLOPT_USERAGENT => 'TryFit/1.0',
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
         ]);
         curl_exec($ch);
         $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -365,6 +389,7 @@ class TryOnController
         fclose($fp);
 
         if ($status < 200 || $status >= 300) {
+            @unlink($tempPath);
             return null;
         }
 
@@ -406,6 +431,15 @@ class TryOnController
      */
     private function resolveGarmentType(?array $mapping, array $payload): string
     {
+        $prompt = $mapping['clothing_prompt'] ?? ($payload['clothing_prompt'] ?? null);
+
+        // Full-body garments (saree, lehenga, dress…) must always map to 'full'
+        // regardless of what the merchant stored — sending them as 'tops' produces
+        // a short-dress result because Fashn only replaces the upper body.
+        if (!empty($prompt) && $this->inferGarmentTypeFromPrompt($prompt) === 'full') {
+            return 'full';
+        }
+
         if (!empty($mapping['garment_type'])) {
             $gt = strtolower((string)$mapping['garment_type']);
             if (in_array($gt, ['top', 'bottom', 'full'], true)) {
@@ -413,10 +447,13 @@ class TryOnController
             }
         }
 
-        $prompt = $mapping['clothing_prompt'] ?? ($payload['clothing_prompt'] ?? null);
         return $this->inferGarmentTypeFromPrompt($prompt);
     }
 
+    /**
+     * Maps a clothing prompt to a Fashn garment-type category.
+     * Returns 'top', 'bottom', or 'full'.
+     */
     private function inferGarmentTypeFromPrompt(?string $prompt): string
     {
         if (empty($prompt)) {
@@ -438,81 +475,14 @@ class TryOnController
         return 'top';
     }
 
-    // ── Image compositing ─────────────────────────────────────────────────────
-
-    /**
-     * Paste the original avatar's lower body onto the AI result image.
-     * Uses a gradient blend at the waist line so the seam is invisible.
-     * Returns composited JPEG bytes, or null if GD is unavailable / fails.
-     */
-    private function compositeBottomHalf(string $resultBytes, string $avatarPath): ?string
+    /** Maps a clothing prompt to a FlatLayConverter garment hint key. */
+    private function inferFlatLayGarmentHint(string $prompt): string
     {
-        if (!function_exists('imagecreatefromstring') || !function_exists('imagecopymerge')) {
-            return null;
-        }
-
-        $resultImg = @imagecreatefromstring($resultBytes);
-        if ($resultImg === false) {
-            return null;
-        }
-
-        $avatarRaw = @file_get_contents($avatarPath);
-        if ($avatarRaw === false) {
-            imagedestroy($resultImg);
-            return null;
-        }
-
-        $avatarImg = @imagecreatefromstring($avatarRaw);
-        if ($avatarImg === false) {
-            imagedestroy($resultImg);
-            return null;
-        }
-
-        $rW = imagesx($resultImg);
-        $rH = imagesy($resultImg);
-
-        // Resize avatar to match result canvas so pixel rows line up
-        if (imagesx($avatarImg) !== $rW || imagesy($avatarImg) !== $rH) {
-            $resized = imagecreatetruecolor($rW, $rH);
-            if ($resized === false) {
-                imagedestroy($resultImg);
-                imagedestroy($avatarImg);
-                return null;
-            }
-            imagecopyresampled($resized, $avatarImg, 0, 0, 0, 0, $rW, $rH, imagesx($avatarImg), imagesy($avatarImg));
-            imagedestroy($avatarImg);
-            $avatarImg = $resized;
-        }
-
-        // Waist split: blend from 50 % to 65 % of image height.
-        // Above 50 %  → 100 % AI result  (new top-wear visible)
-        // 50 % – 65 % → smooth cosine gradient from result to original avatar
-        //               (wider zone = invisible seam even when shirts are long)
-        // Below 65 %  → 100 % original avatar (legs, shoes, background intact)
-        $blendStart = (int)($rH * 0.50);
-        $blendEnd   = (int)($rH * 0.65);
-        $blendRange = max(1, $blendEnd - $blendStart);
-
-        for ($y = $blendStart; $y < $blendEnd; $y++) {
-            // Use a cosine ease-in curve (slow start → fast finish) so the
-            // seam between new garment and original lower body is imperceptible.
-            $t   = ($y - $blendStart) / $blendRange;           // 0.0 … 1.0
-            $pct = (int)(100 * (1 - cos($t * M_PI)) / 2);     // cosine ease
-            imagecopymerge($resultImg, $avatarImg, 0, $y, 0, $y, $rW, 1, $pct);
-        }
-
-        // Hard copy — avatar lower half, no blending needed below the seam
-        if ($rH > $blendEnd) {
-            imagecopy($resultImg, $avatarImg, 0, $blendEnd, 0, $blendEnd, $rW, $rH - $blendEnd);
-        }
-
-        ob_start();
-        imagejpeg($resultImg, null, 90);
-        $composited = ob_get_clean();
-
-        imagedestroy($resultImg);
-        imagedestroy($avatarImg);
-
-        return (is_string($composited) && $composited !== '') ? $composited : null;
+        if ($prompt === '') return 'default';
+        $p = strtolower($prompt);
+        if (preg_match('/\b(saree|sari)\b/', $p)) return 'saree';
+        if (preg_match('/\blehenga\b/', $p))      return 'lehenga';
+        return 'default';
     }
+
 }

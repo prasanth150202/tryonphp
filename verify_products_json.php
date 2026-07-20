@@ -12,6 +12,30 @@ if (($_GET['key'] ?? '') !== 'migrate2025') {
 header('Content-Type: application/json');
 
 require_once __DIR__ . '/config/AppConfig.php';
+
+// Load .env — only router.php does this normally; this script is hit directly
+// and bypasses router.php, so without this AppConfig::dbHost() etc. all read
+// empty strings and Database::getInstance() fatals on an empty-credential PDO connect.
+$envFile = __DIR__ . '/.env';
+if (is_file($envFile)) {
+    $lines = file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '' || str_starts_with($line, '#')) {
+            continue;
+        }
+        if (strpos($line, '=') !== false) {
+            [$k, $v] = explode('=', $line, 2);
+            $k = trim($k);
+            $v = trim($v);
+            if (!isset($_ENV[$k]) && getenv($k) === false) {
+                putenv("{$k}={$v}");
+                $_ENV[$k] = $v;
+            }
+        }
+    }
+}
+
 require_once __DIR__ . '/db/Database.php';
 
 $pdo = \TryFit\Db\Database::getInstance();

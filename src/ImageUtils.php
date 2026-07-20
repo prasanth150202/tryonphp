@@ -135,4 +135,97 @@ final class ImageUtils
         $mime  = self::detectMimeType($filePath);
         return 'data:' . $mime . ';base64,' . base64_encode($bytes);
     }
+
+    /**
+     * Scale $bytes (contain, centred) onto a $size x $size white canvas and
+     * re-encode as PNG. Used to normalise gpt-image-1's native 1024x1024
+     * output (it has no 1080x1080 size option) to the requested 1080x1080
+     * commercial-quality infographic dimensions.
+     */
+    public static function padToSquare(string $bytes, int $size = 1080): string
+    {
+        if (!function_exists('imagecreatefromstring') || !function_exists('imagecreatetruecolor')) {
+            return $bytes;
+        }
+
+        $src = @imagecreatefromstring($bytes);
+        if ($src === false) {
+            return $bytes;
+        }
+
+        $srcW = imagesx($src);
+        $srcH = imagesy($src);
+
+        $canvas = imagecreatetruecolor($size, $size);
+        if ($canvas === false) {
+            imagedestroy($src);
+            return $bytes;
+        }
+
+        $white = imagecolorallocate($canvas, 255, 255, 255);
+        imagefill($canvas, 0, 0, $white);
+
+        $scale = min($size / max($srcW, 1), $size / max($srcH, 1));
+        $newW  = (int) round($srcW * $scale);
+        $newH  = (int) round($srcH * $scale);
+        $offX  = (int) floor(($size - $newW) / 2);
+        $offY  = (int) floor(($size - $newH) / 2);
+
+        imagecopyresampled($canvas, $src, $offX, $offY, 0, 0, $newW, $newH, $srcW, $srcH);
+        imagedestroy($src);
+
+        ob_start();
+        imagepng($canvas);
+        $out = (string) ob_get_clean();
+        imagedestroy($canvas);
+
+        return $out !== '' ? $out : $bytes;
+    }
+
+    /**
+     * Generate a scaled-down JPEG thumbnail of $sourcePath at $destPath, for
+     * fast-loading Asset Library grids. Returns false (and leaves $destPath
+     * untouched) when GD is unavailable or the source can't be read.
+     */
+    public static function makeThumbnail(string $sourcePath, string $destPath, int $maxDim = 320): bool
+    {
+        if (!function_exists('imagecreatefromstring') || !function_exists('imagecopyresampled')) {
+            return false;
+        }
+
+        $data = @file_get_contents($sourcePath);
+        if ($data === false) {
+            return false;
+        }
+
+        $src = @imagecreatefromstring($data);
+        if ($src === false) {
+            return false;
+        }
+
+        $w = imagesx($src);
+        $h = imagesy($src);
+        $scale = min($maxDim / max($w, 1), $maxDim / max($h, 1), 1.0);
+        $newW  = max(1, (int) round($w * $scale));
+        $newH  = max(1, (int) round($h * $scale));
+
+        $dst = imagecreatetruecolor($newW, $newH);
+        if ($dst === false) {
+            imagedestroy($src);
+            return false;
+        }
+
+        imagecopyresampled($dst, $src, 0, 0, 0, 0, $newW, $newH, $w, $h);
+        imagedestroy($src);
+
+        $dir = dirname($destPath);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+
+        $ok = @imagejpeg($dst, $destPath, 80);
+        imagedestroy($dst);
+
+        return (bool) $ok;
+    }
 }

@@ -93,6 +93,14 @@ class WidgetController
 
         $flat = $this->flatConfig($raw);
 
+        // Free / basic plan merchants always show the watermark regardless of their saved setting.
+        // Paid plans with branding_removable respect the per-shop toggle.
+        $plan = strtolower(trim((string)($merchant['plan'] ?? '')));
+        $freePlans = ['', 'free', 'basic'];
+        if (in_array($plan, $freePlans, true)) {
+            $flat['show_watermark'] = true;
+        }
+
         // Only include enabled-product lists when the data is actually populated.
         // Omitting the keys causes the JS to fall back to "show icon on all cards"
         // mode, which is the correct behaviour before any product sync has run.
@@ -225,6 +233,7 @@ class WidgetController
             'icon_opacity'           => (int)($cfg['icon_opacity']           ?? $d['icon_opacity']),
             'show_on_collection'     => (bool)($cfg['show_on_collection']    ?? $d['show_on_collection']),
             'collection_position'    => $cfg['collection_position']    ?? $d['collection_position'],
+            'show_watermark'         => (bool)($cfg['show_watermark']        ?? $d['show_watermark']),
             'share_whatsapp_enabled' => (bool)($cfg['share_whatsapp_enabled'] ?? $d['share_whatsapp_enabled']),
             'save_image_enabled'     => (bool)($cfg['save_image_enabled']    ?? $d['save_image_enabled']),
             'privacy_notice_shown'   => (bool)($cfg['privacy_notice_shown']  ?? $d['privacy_notice_shown']),

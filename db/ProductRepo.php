@@ -241,6 +241,8 @@ class ProductRepo
      */
     public function saveVariantMapping(int $merchantId, int $productId, array $mapping): void
     {
+        $this->ensureVariantMappingColumns();
+
         $stmt = $this->db->prepare(
             'INSERT INTO variant_image_mappings
              (merchant_id, product_id, shopify_variant_id, shopify_variant_gid, variant_title,
@@ -322,6 +324,36 @@ class ProductRepo
      * Adds the `handle` column to products if it does not yet exist.
      * Uses a static flag so the INFORMATION_SCHEMA query only runs once per request.
      */
+    /**
+     * Adds any missing columns to variant_image_mappings (self-healing migration).
+     * Runs once per request via static flag.
+     */
+    private function ensureVariantMappingColumns(): void
+    {
+        static $ensured = false;
+        if ($ensured) return;
+        $ensured = true;
+
+        $stmt = $this->db->query(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'variant_image_mappings'"
+        );
+        $existing = array_flip($stmt->fetchAll(PDO::FETCH_COLUMN));
+
+        $needed = [
+            'garment_type'    => "ALTER TABLE variant_image_mappings ADD COLUMN garment_type ENUM('top','bottom','full') NOT NULL DEFAULT 'top'",
+            'avatar_sex'      => "ALTER TABLE variant_image_mappings ADD COLUMN avatar_sex ENUM('male','female') DEFAULT NULL",
+            'clothing_prompt' => "ALTER TABLE variant_image_mappings ADD COLUMN clothing_prompt VARCHAR(200) DEFAULT NULL",
+            'is_approved'     => "ALTER TABLE variant_image_mappings ADD COLUMN is_approved TINYINT(1) NOT NULL DEFAULT 1",
+        ];
+
+        foreach ($needed as $col => $ddl) {
+            if (!isset($existing[$col])) {
+                try { $this->db->exec($ddl); } catch (\Throwable $e) { /* already exists */ }
+            }
+        }
+    }
+
     private function ensureHandleColumn(): void
     {
         static $ensured = false;

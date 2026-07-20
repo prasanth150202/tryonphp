@@ -59,6 +59,17 @@ final class AppConfig
         return self::fashnApiKey() !== '';
     }
 
+    public static function falApiKey(): string
+    {
+        return (string) (getenv('FAL_API_KEY') ?: '');
+    }
+
+    /** Returns true when FAL.ai flat-lay pre-processing is enabled. */
+    public static function useFlatLayConverter(): bool
+    {
+        return self::falApiKey() !== '';
+    }
+
     public static function masterApiKey(): string
     {
         return (string) (getenv('MASTER_API_KEY') ?: '');
@@ -67,6 +78,11 @@ final class AppConfig
     public static function shopifyApiSecret(): string
     {
         return (string) (getenv('SHOPIFY_API_SECRET') ?: '');
+    }
+
+    public static function openAiApiKey(): string
+    {
+        return (string) (getenv('OPENAI_API_KEY') ?: '');
     }
 
     /** Prefix applied to every generated merchant API key. */
@@ -150,6 +166,18 @@ final class AppConfig
     public static function tempDir(): string
     {
         return dirname(__DIR__) . DIRECTORY_SEPARATOR . 'temp';
+    }
+
+    /** Permanent storage for merchant-uploaded/saved model photos (Saved Models gallery). */
+    public static function libraryDir(): string
+    {
+        return dirname(__DIR__) . DIRECTORY_SEPARATOR . 'library';
+    }
+
+    /** Permanent storage for FASHN-generated model images and OpenAI marketing infographics. */
+    public static function generationsDir(): string
+    {
+        return dirname(__DIR__) . DIRECTORY_SEPARATOR . 'generations';
     }
 
     public static function resultsTtlHours(): int

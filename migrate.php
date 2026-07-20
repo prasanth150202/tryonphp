@@ -286,6 +286,22 @@ runSQL($pdo, 'analytics_daily: backfill shopify_domain + store_id',
 runSQL($pdo, '012: variant_image_mappings add garment_type',
     "ALTER TABLE variant_image_mappings ADD COLUMN IF NOT EXISTS garment_type ENUM('top','bottom','full') NOT NULL DEFAULT 'top' AFTER image_type", $log);
 
+// ── Migration 013: avatar_sex, clothing_prompt, is_approved ──────────────────
+runSQL($pdo, '013: variant_image_mappings add avatar_sex',
+    "ALTER TABLE variant_image_mappings ADD COLUMN IF NOT EXISTS avatar_sex ENUM('male','female') DEFAULT NULL AFTER garment_type", $log);
+runSQL($pdo, '013: variant_image_mappings add clothing_prompt',
+    "ALTER TABLE variant_image_mappings ADD COLUMN IF NOT EXISTS clothing_prompt VARCHAR(200) DEFAULT NULL AFTER avatar_sex", $log);
+runSQL($pdo, '013: variant_image_mappings add is_approved',
+    "ALTER TABLE variant_image_mappings ADD COLUMN IF NOT EXISTS is_approved TINYINT(1) NOT NULL DEFAULT 1 AFTER clothing_prompt", $log);
+runSQL($pdo, '013: merchant_settings add show_watermark',
+    "ALTER TABLE merchant_settings ADD COLUMN IF NOT EXISTS show_watermark TINYINT(1) NOT NULL DEFAULT 1", $log);
+runSQL($pdo, '013: merchant_settings add share_whatsapp_enabled',
+    "ALTER TABLE merchant_settings ADD COLUMN IF NOT EXISTS share_whatsapp_enabled TINYINT(1) NOT NULL DEFAULT 1", $log);
+runSQL($pdo, '013: merchant_settings add save_image_enabled',
+    "ALTER TABLE merchant_settings ADD COLUMN IF NOT EXISTS save_image_enabled TINYINT(1) NOT NULL DEFAULT 1", $log);
+runSQL($pdo, '013: merchant_settings add privacy_notice_shown',
+    "ALTER TABLE merchant_settings ADD COLUMN IF NOT EXISTS privacy_notice_shown TINYINT(1) NOT NULL DEFAULT 1", $log);
+
 // ── Final: show merchant_settings with domain populated ──────────────────────
 $rows = $pdo->query(
     "SELECT id, merchant_id, shopify_domain, shopify_store_id, created_at FROM merchant_settings ORDER BY id"
