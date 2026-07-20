@@ -239,7 +239,7 @@ class TryOnController
             ], $result['status_code'] === 429 ? 503 : 400);
         }
 
-        $resultsDir = Config::resultsDir();
+        $resultsDir = AppConfig::resultsDir();
         if (!is_dir($resultsDir)) {
             @mkdir($resultsDir, 0755, true);
         }
